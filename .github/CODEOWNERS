@@ -1,0 +1,14 @@
+# Default owner for every file in this repo. Listed last in each block takes
+# precedence per GitHub's CODEOWNERS semantics.
+#
+# When a PR touches any path, the matching owner is auto-requested for review.
+# With `require_code_owner_reviews` enabled on the branch protection rule, a
+# PR cannot merge until a CODEOWNER has approved (or, for the current solo
+# maintainer phase, until the self-approval/bypass path is used — see
+# enforce_admins=false in branch protection).
+#
+# Keep this file BORING. If per-path ownership diverges, prefer adding a
+# specific line here instead of a separate OWNERS file, a bot config, or a
+# cursor rule. CODEOWNERS is the one place GitHub looks.
+
+*       @Flomenco-Inc/flo-admins
