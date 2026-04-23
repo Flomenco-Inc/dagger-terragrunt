@@ -267,22 +267,23 @@ func (m *DaggerTerragrunt) runTerragrunt(
 	// and then execs terragrunt. We carefully avoid `set -x` because we do
 	// NOT want the session credentials echoed to stdout. `set -e` is enough
 	// to fail fast on any error.
+	// AWS CLI v2 (2.34+) only exposes `--web-identity-token <value>` as a
+	// CLI flag; `--web-identity-token-file` is NOT a valid CLI parameter
+	// (it only exists as a `web_identity_token_file` profile setting in
+	// ~/.aws/config). We therefore read the mounted secret file once into
+	// a local shell variable and pass it inline. The variable lives only
+	// for the duration of the shell script and is never exported or
+	// logged.
 	script := fmt.Sprintf(`set -eu
-# Diagnostic: confirm the OIDC token is actually mounted and non-empty.
-# Only file size is logged; the plaintext never appears in output.
-if [ -f %q ]; then
-  echo "DEBUG: oidc token file size (bytes): $(wc -c < %q)"
-else
-  echo "DEBUG: oidc token file MISSING at %s"
-  ls -la %s 2>&1 || true
-fi
+oidc_jwt=$(cat %q)
 creds=$(aws sts assume-role-with-web-identity \
   --role-arn %q \
   --role-session-name %q \
-  --web-identity-token-file %q \
+  --web-identity-token "$oidc_jwt" \
   --duration-seconds %d \
   --output text \
   --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]')
+unset oidc_jwt
 
 # $creds is a tab-separated triple on one line. Parse into env vars.
 IFS=$'\t' read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN <<EOF
@@ -294,11 +295,8 @@ unset creds
 cd %q
 terragrunt --non-interactive %s
 `,
-		oidcTokenPath, oidcTokenPath, oidcTokenPath,
-		// `dirname` of the path, for the `ls -la` diagnostic when the file
-		// is missing. Hardcoded because the tmpfs mount always lives here.
-		"/run/secrets",
-		roleArn, sessionName, oidcTokenPath, durationSeconds,
+		oidcTokenPath,
+		roleArn, sessionName, durationSeconds,
 		"./"+env, terragruntCmd,
 	)
 
