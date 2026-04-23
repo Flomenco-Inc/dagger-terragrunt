@@ -268,6 +268,14 @@ func (m *DaggerTerragrunt) runTerragrunt(
 	// NOT want the session credentials echoed to stdout. `set -e` is enough
 	// to fail fast on any error.
 	script := fmt.Sprintf(`set -eu
+# Diagnostic: confirm the OIDC token is actually mounted and non-empty.
+# Only file size is logged; the plaintext never appears in output.
+if [ -f %q ]; then
+  echo "DEBUG: oidc token file size (bytes): $(wc -c < %q)"
+else
+  echo "DEBUG: oidc token file MISSING at %s"
+  ls -la %s 2>&1 || true
+fi
 creds=$(aws sts assume-role-with-web-identity \
   --role-arn %q \
   --role-session-name %q \
@@ -286,6 +294,10 @@ unset creds
 cd %q
 terragrunt --non-interactive %s
 `,
+		oidcTokenPath, oidcTokenPath, oidcTokenPath,
+		// `dirname` of the path, for the `ls -la` diagnostic when the file
+		// is missing. Hardcoded because the tmpfs mount always lives here.
+		"/run/secrets",
 		roleArn, sessionName, oidcTokenPath, durationSeconds,
 		"./"+env, terragruntCmd,
 	)
