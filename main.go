@@ -334,6 +334,23 @@ EOF
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 unset creds
 
+# Diagnostics: verify the session credentials parsed cleanly. Print lengths
+# only (never values). Whitespace or CR in any field will show up as an
+# unexpectedly long count or a non-zero result from the printf|od check.
+echo "diag: AWS_ACCESS_KEY_ID length=${#AWS_ACCESS_KEY_ID} first3=${AWS_ACCESS_KEY_ID:0:3}"
+echo "diag: AWS_SECRET_ACCESS_KEY length=${#AWS_SECRET_ACCESS_KEY}"
+echo "diag: AWS_SESSION_TOKEN length=${#AWS_SESSION_TOKEN}"
+# Hex-dump the first byte of each to catch any leading control chars (BOM etc).
+printf '%%s' "$AWS_ACCESS_KEY_ID" | od -An -c -N 4 | sed 's/^/diag: AWS_ACCESS_KEY_ID head_bytes:/'
+printf '%%s' "$AWS_SECRET_ACCESS_KEY" | od -An -c -N 4 | sed 's/^/diag: AWS_SECRET_ACCESS_KEY head_bytes:/'
+printf '%%s' "$AWS_SESSION_TOKEN" | od -An -c -N 4 | sed 's/^/diag: AWS_SESSION_TOKEN head_bytes:/'
+# Prove the creds work for a trivial API call. If this fails, the bug is
+# in how we assembled/exported the session creds. If it succeeds but the
+# subsequent chained AssumeRole still fails with IncompleteSignature, the
+# bug is specific to the chained call (likely terraform-aws-provider).
+echo "diag: sts get-caller-identity ..."
+aws sts get-caller-identity --region "${AWS_REGION:-us-east-1}" --output json | sed 's/^/diag: gci: /' || echo "diag: get-caller-identity FAILED: $?"
+
 %s
 cd %q
 terragrunt --non-interactive %s
