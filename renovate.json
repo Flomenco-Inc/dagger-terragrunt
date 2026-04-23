@@ -1,0 +1,43 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":semanticCommitTypeAll(chore)",
+    ":dependencyDashboard",
+    ":separateMajorReleases"
+  ],
+  "labels": ["dependencies"],
+  "timezone": "America/Los_Angeles",
+  "schedule": ["before 5am on monday"],
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "packageRules": [
+    {
+      "description": "Group all GitHub Actions bumps into a single weekly PR",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Group Go module bumps (Dagger SDK + transitives)",
+      "matchManagers": ["gomod"],
+      "groupName": "go modules"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track tool versions pinned as Go consts in main.go (Terragrunt, Terraform)",
+      "managerFilePatterns": ["main.go"],
+      "matchStrings": [
+        "default(?<depNameCamel>Terragrunt|Terraform)Version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "{{#if (equals depNameCamel 'Terragrunt')}}gruntwork-io/terragrunt{{else if (equals depNameCamel 'Terraform')}}hashicorp/terraform{{/if}}"
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security"]
+  }
+}
