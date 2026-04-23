@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Smoke tests for the dagger-terragrunt module itself. Same philosophy as
+# dagger-ci: we deliberately skip functional tests of plan/apply (those would
+# require real AWS creds + a sandbox terragrunt repo) and rely on the Dagger
+# engine's own schema validation to catch ~every realistic breakage.
+
+jobs:
+  module-loads:
+    name: dagger module loads
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Install Dagger CLI
+        run: |
+          set -eux
+          curl -fsSL https://dl.dagger.io/dagger/install.sh \
+            | DAGGER_VERSION=0.20.6 BIN_DIR=/usr/local/bin sudo -E sh
+          dagger version
+
+      - name: dagger develop (regenerates SDK bindings)
+        run: dagger develop
+
+      - name: dagger functions (validates module schema)
+        run: dagger functions
+
+      - name: go vet (validates module compiles)
+        run: |
+          go mod tidy
+          go vet ./...
