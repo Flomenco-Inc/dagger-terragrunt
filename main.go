@@ -227,11 +227,13 @@ func (m *DaggerTerragrunt) Apply(
 	return m.runTerragrunt(
 		ctx, src, env, roleArn, oidcToken, gitToken,
 		region, sessionName, durationSeconds, tgVersion, tfVersion,
-		// --auto-approve because apply is gated at the GHA environment
-		// level — the human approval happens before this container ever
-		// runs. If the environment gate is removed, --auto-approve must
-		// be removed too or nothing gates.
-		"run --all apply --auto-approve",
+		// --auto-approve is a Terraform flag, not a Terragrunt flag;
+		// Terragrunt >=0.68 requires forwarding such flags after `--`.
+		// The gate for this mutation is the GHA environment approval
+		// upstream — the human ok happens before this container ever
+		// runs. If that gate is removed, --auto-approve must be removed
+		// too or nothing gates.
+		"run --all apply -- -auto-approve",
 	)
 }
 
