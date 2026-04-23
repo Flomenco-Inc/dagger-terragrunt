@@ -47,7 +47,7 @@ Runs:
 
 No AWS calls. No credentials required. Safe to run on untrusted PRs.
 
-### `plan --src=<dir> --env=<dev|stg|prd> --role-arn=<arn> --oidc-token=env:OIDC_TOKEN [opts]`
+### `plan --src=<dir> --env=<dev|stg|prd> --role-arn=<arn> --oidc-token=env://OIDC_TOKEN [opts]`
 
 Runs `terragrunt --non-interactive run --all plan` scoped to `./<env>/`.
 
@@ -58,7 +58,7 @@ Required args:
 - `--role-arn` — IAM role ARN to assume. The role must trust the GitHub
   Actions OIDC provider with a `sub` claim matching the caller's repo/branch.
 - `--oidc-token` — OIDC JWT minted by `core.getIDToken("sts.amazonaws.com")`.
-  Always pass as a Dagger secret (`env:OIDC_TOKEN`) so the plaintext never
+  Always pass as a Dagger secret (`env://OIDC_TOKEN`) so the plaintext never
   touches the command line.
 
 Optional:
@@ -70,7 +70,7 @@ Optional:
   `MaxSessionDuration` on the plan/apply roles; must be ≤ the role's cap)
 - `--tg-version`, `--tf-version`
 
-### `apply --src=<dir> --env=<...> --role-arn=<arn> --oidc-token=env:OIDC_TOKEN [opts]`
+### `apply --src=<dir> --env=<...> --role-arn=<arn> --oidc-token=env://OIDC_TOKEN [opts]`
 
 Same signature as `plan`. Runs
 `terragrunt --non-interactive run --all apply --auto-approve`. **This
@@ -161,7 +161,7 @@ jobs:
             call -m github.com/Flomenco-Inc/dagger-terragrunt@v0.1.0 \
               plan --src=. --env=${{ matrix.env }} \
                 --role-arn=arn:aws:iam::${{ vars.FLO_DEV_ACCOUNT_ID }}:role/gha-terragrunt-plan \
-                --oidc-token=env:OIDC_TOKEN \
+                --oidc-token=env://OIDC_TOKEN \
                 --session-name=gha-${{ github.run_id }}
 ```
 
@@ -201,7 +201,7 @@ jobs:
             call -m github.com/Flomenco-Inc/dagger-terragrunt@v0.1.0 \
               apply --src=. --env=${{ matrix.env }} \
                 --role-arn=arn:aws:iam::${{ vars.FLO_DEV_ACCOUNT_ID }}:role/gha-terragrunt-apply \
-                --oidc-token=env:OIDC_TOKEN \
+                --oidc-token=env://OIDC_TOKEN \
                 --session-name=gha-${{ github.run_id }}
 ```
 
