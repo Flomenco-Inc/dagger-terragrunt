@@ -17,13 +17,20 @@ accepted at the public API boundary is:
 
 - `--role-arn` — the IAM role in the target AWS account.
 - `--oidc-token` — a short-lived GitHub Actions OIDC JWT (`Secret`).
+- `--git-token` — **optional** short-lived GitHub App installation token
+  (`Secret`) used to clone private Terraform module repos referenced by
+  terragrunt. Mint via `actions/create-github-app-token` in the caller
+  workflow. Omit when every referenced module is public.
 
 Inside the Dagger container the module runs
 `aws sts assume-role-with-web-identity` and exports the resulting session
 credentials as env vars **for the single terragrunt invocation only**. The
 session creds never leave the Dagger exec, and the OIDC token is mounted on
 a tmpfs (`/run/secrets/oidc-token`) so it is never logged, never persisted
-in the Dagger cache, and never exposed as a container env var.
+in the Dagger cache, and never exposed as a container env var. If provided,
+the git token is mounted on a separate tmpfs (`/run/secrets/gh-token`) and
+consumed by an in-memory `git config url.insteadOf` rule so terragrunt's
+module downloads authenticate as the `flo-ci` GitHub App installation.
 
 No path accepts `--aws-access-key-id` / `--aws-secret-access-key`. That
 would make it syntactically possible to pass a long-lived IAM user key, and
@@ -32,11 +39,11 @@ signature IS the policy surface. We eliminated the option structurally.
 
 ## Functions
 
-| Function    | Credentials              | Mutates state?        | When to call it                          |
-| ----------- | ------------------------ | --------------------- | ---------------------------------------- |
-| `validate`  | **none**                 | no                    | Every PR — fast structural checks.       |
-| `plan`      | OIDC role + token        | no (read-only APIs)   | Every PR — shows diff, posts to PR body. |
-| `apply`     | OIDC role + token        | **YES**               | After PR merge + environment approval.   |
+| Function    | Credentials                              | Mutates state?        | When to call it                          |
+| ----------- | ---------------------------------------- | --------------------- | ---------------------------------------- |
+| `validate`  | **none**                                 | no                    | Every PR — fast structural checks.       |
+| `plan`      | OIDC role + token (+ optional git-token) | no (read-only APIs)   | Every PR — shows diff, posts to PR body. |
+| `apply`     | OIDC role + token (+ optional git-token) | **YES**               | After PR merge + environment approval.   |
 
 ### `validate --src=<dir> [--tg-version=v1.0.2] [--tf-version=1.9.8]`
 
@@ -47,7 +54,7 @@ Runs:
 
 No AWS calls. No credentials required. Safe to run on untrusted PRs.
 
-### `plan --src=<dir> --env=<dev|stg|prd> --role-arn=<arn> --oidc-token=env://OIDC_TOKEN [opts]`
+### `plan --src=<dir> --env=<dev|stg|prd> --role-arn=<arn> --oidc-token=env:OIDC_TOKEN [opts]`
 
 Runs `terragrunt --non-interactive run --all plan` scoped to `./<env>/`.
 
@@ -58,11 +65,13 @@ Required args:
 - `--role-arn` — IAM role ARN to assume. The role must trust the GitHub
   Actions OIDC provider with a `sub` claim matching the caller's repo/branch.
 - `--oidc-token` — OIDC JWT minted by `core.getIDToken("sts.amazonaws.com")`.
-  Always pass as a Dagger secret (`env://OIDC_TOKEN`) so the plaintext never
+  Always pass as a Dagger secret (`env:OIDC_TOKEN`) so the plaintext never
   touches the command line.
 
 Optional:
 
+- `--git-token` — GitHub App installation token for private module cloning
+  (see [Private module access](#private-module-access) below).
 - `--region` (default `us-east-2`)
 - `--session-name` (default `dagger-terragrunt`; set to something
   CI-specific like `gha-${{ github.run_id }}` for traceability in CloudTrail)
@@ -70,7 +79,7 @@ Optional:
   `MaxSessionDuration` on the plan/apply roles; must be ≤ the role's cap)
 - `--tg-version`, `--tf-version`
 
-### `apply --src=<dir> --env=<...> --role-arn=<arn> --oidc-token=env://OIDC_TOKEN [opts]`
+### `apply --src=<dir> --env=<...> --role-arn=<arn> --oidc-token=env:OIDC_TOKEN [opts]`
 
 Same signature as `plan`. Runs
 `terragrunt --non-interactive run --all apply --auto-approve`. **This
@@ -146,7 +155,6 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Mint OIDC token
-        id: oidc
         uses: actions/github-script@v7
         with:
           script: |
@@ -154,14 +162,28 @@ jobs:
             core.setSecret(tok);
             core.exportVariable("OIDC_TOKEN", tok);
 
+      - name: Mint GitHub App token for private modules
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.FLO_CI_APP_ID }}
+          private-key: ${{ secrets.FLO_CI_APP_PRIVATE_KEY }}
+          owner: Flomenco-Inc
+
+      - name: Export git token to env
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: echo "GH_TOKEN=${GH_TOKEN}" >> "$GITHUB_ENV"
+
       - uses: dagger/dagger-for-github@v8
         with:
           version: v0.20.6
           call: |
-            call -m github.com/Flomenco-Inc/dagger-terragrunt@v0.1.0 \
+            call -m github.com/Flomenco-Inc/dagger-terragrunt@v0.2.0 \
               plan --src=. --env=${{ matrix.env }} \
                 --role-arn=arn:aws:iam::${{ vars.FLO_DEV_ACCOUNT_ID }}:role/gha-terragrunt-plan \
                 --oidc-token=env://OIDC_TOKEN \
+                --git-token=env://GH_TOKEN \
                 --session-name=gha-${{ github.run_id }}
 ```
 
@@ -186,7 +208,6 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Mint OIDC token
-        id: oidc
         uses: actions/github-script@v7
         with:
           script: |
@@ -194,14 +215,28 @@ jobs:
             core.setSecret(tok);
             core.exportVariable("OIDC_TOKEN", tok);
 
+      - name: Mint GitHub App token for private modules
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.FLO_CI_APP_ID }}
+          private-key: ${{ secrets.FLO_CI_APP_PRIVATE_KEY }}
+          owner: Flomenco-Inc
+
+      - name: Export git token to env
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: echo "GH_TOKEN=${GH_TOKEN}" >> "$GITHUB_ENV"
+
       - uses: dagger/dagger-for-github@v8
         with:
           version: v0.20.6
           call: |
-            call -m github.com/Flomenco-Inc/dagger-terragrunt@v0.1.0 \
+            call -m github.com/Flomenco-Inc/dagger-terragrunt@v0.2.0 \
               apply --src=. --env=${{ matrix.env }} \
                 --role-arn=arn:aws:iam::${{ vars.FLO_DEV_ACCOUNT_ID }}:role/gha-terragrunt-apply \
                 --oidc-token=env://OIDC_TOKEN \
+                --git-token=env://GH_TOKEN \
                 --session-name=gha-${{ github.run_id }}
 ```
 
@@ -210,6 +245,50 @@ The required-reviewers gate sits on the GitHub Actions **environment**
 "two-approver rule for prd applies" from the migration plan. Branch
 protection only enforces that commits landed on `main` via PR — approval
 to **deploy** is a separate, per-env decision.
+
+### Private module access
+
+Flo's `terraform-aws-*` modules are all private repos. Terragrunt's
+`module { source = "git::https://github.com/Flomenco-Inc/..." }` clones
+therefore need authentication, which this module delegates to a GitHub
+**App** (`flo-ci`) rather than SSH deploy keys or personal access tokens.
+
+Why the App pattern, concretely:
+
+- **Ephemerality.** `actions/create-github-app-token` mints an
+  installation token that expires in ≤1 hour. If a CI log somehow leaks the
+  token, the blast window is bounded. A PAT would be valid for whatever
+  expiry the creator picked (often never).
+- **No human bus factor.** Tokens aren't tied to a person's account. When
+  someone leaves the org, App installations keep working. SSH deploy keys
+  and PATs don't.
+- **Installation-scoped.** The App is installed only on the repos it needs
+  (all `terraform-aws-*`, `dagger-*`, plus the three terragrunt repos) with
+  `Contents: Read-only`. Tokens minted against that installation cannot
+  reach other repos even if compromised.
+- **Auditable.** Every token issuance shows up in org audit log with the
+  run ID. SSH key auth and PAT auth do not.
+
+The App ID lives in `vars.FLO_CI_APP_ID` (org variable) and the private key
+lives in `secrets.FLO_CI_APP_PRIVATE_KEY` (org secret), both visible to all
+repos that need them.
+
+Inside the container we set:
+
+```bash
+git config --global \
+  url."https://x-access-token:${TOKEN}@github.com/".insteadOf \
+  "https://github.com/"
+```
+
+This rewrites any `https://github.com/...` clone that terragrunt issues
+(including the `git::https://` sources in `.hcl`) to use the App token
+transparently. The token is never written to `~/.git-credentials` — only to
+an in-memory git config entry that dies with the container.
+
+If your terragrunt repo references only public modules, omit `--git-token`
+entirely. The insteadOf rule is not configured in that case, and
+anonymous clones of public repos work as normal.
 
 ### IAM role trust policy sketch
 
@@ -257,5 +336,14 @@ Same semver discipline as `dagger-ci`:
 - Minor: new function or backwards-compatible arg addition.
 - Major: breaking signature change.
 
-Tag releases with `git tag v0.1.0 && git push --tags`. No v0.1.0-prior
-history exists — the OIDC-native design is the initial public release.
+Tag releases with `git tag v0.2.0 && git push --tags`.
+
+Release history:
+
+- `v0.1.0` — initial OIDC-native release.
+- `v0.1.1` — diagnostic logging around OIDC secret mount.
+- `v0.1.2` — fix AWS CLI 2.34 `--web-identity-token-file` incompatibility
+  by reading the mounted OIDC secret inline into `--web-identity-token`.
+- `v0.2.0` — add optional `--git-token` Secret parameter for authenticated
+  cloning of private Terraform modules via a GitHub App installation
+  token. Backwards-compatible for callers that only use public modules.

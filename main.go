@@ -18,16 +18,27 @@
 //
 //   - role-arn    : the IAM role in the target AWS account
 //   - oidc-token  : a short-lived GitHub-Actions-minted JWT (Secret)
+//   - git-token   : OPTIONAL short-lived GitHub App installation token
+//     (Secret) used to clone private Terraform modules referenced by
+//     terragrunt. When omitted, only public module sources resolve.
 //
-// Inside the container the module runs
+// Inside the container the module:
 //
-//	aws sts assume-role-with-web-identity --role-arn … --web-identity-token-file /run/secrets/oidc-token
+//  1. Reads the OIDC JWT from the mounted secret and exchanges it via
+//     `aws sts assume-role-with-web-identity` for temporary AWS session
+//     credentials. AWS CLI v2 (2.34+) only accepts `--web-identity-token`
+//     inline — `--web-identity-token-file` is NOT a CLI flag, only a
+//     ~/.aws/config profile setting.
+//  2. If a git-token was provided, configures
+//     `git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"`
+//     so that terragrunt's private-module clones authenticate as the
+//     GitHub App installation. The token is mounted on tmpfs and never
+//     written to disk outside the git config line above.
+//  3. Runs the single terragrunt invocation.
 //
-// and exports the returned session credentials as env vars for the single
-// terragrunt invocation. The session creds never leave the Dagger exec, and
-// the OIDC token is only readable inside the container via the tmpfs secret
-// mount — it is not logged, not persisted in the Dagger cache, and not
-// exposed as a container env var.
+// Both secrets are short-lived (AWS session creds ≤15 min by default; the
+// GitHub App token ≤1 h by GitHub policy), are scrubbed from Dagger logs,
+// and are never persisted in the Dagger cache.
 //
 // Accepting `AWS_ACCESS_KEY_ID` at the module boundary would make it
 // syntactically possible to pass a long-lived IAM user key. Even if every
@@ -84,6 +95,11 @@ const (
 	// mounts live on a tmpfs that is only readable for the duration of the
 	// exec — the right place for short-lived credential material.
 	oidcTokenPath = "/run/secrets/oidc-token"
+
+	// Where the optional GitHub App installation token is mounted. Used
+	// by the insteadOf git-config rule so terragrunt's module downloads
+	// authenticate as the flo-ci app installation.
+	gitTokenPath = "/run/secrets/gh-token"
 )
 
 // DaggerTerragrunt is the module's root object. All exported methods are
@@ -147,6 +163,12 @@ func (m *DaggerTerragrunt) Plan(
 	// `sts.amazonaws.com` audience. Passed as a Secret so Dagger mounts it
 	// on a tmpfs inside the container and never logs it.
 	oidcToken *dagger.Secret,
+	// Optional short-lived GitHub App installation token used to clone
+	// private Terraform modules referenced from terragrunt. Mint via
+	// `actions/create-github-app-token` in the caller workflow. When
+	// omitted, only public module sources resolve.
+	// +optional
+	gitToken *dagger.Secret,
 	// +optional
 	// +default="us-east-2"
 	region string,
@@ -164,7 +186,7 @@ func (m *DaggerTerragrunt) Plan(
 	tfVersion string,
 ) (string, error) {
 	return m.runTerragrunt(
-		ctx, src, env, roleArn, oidcToken,
+		ctx, src, env, roleArn, oidcToken, gitToken,
 		region, sessionName, durationSeconds, tgVersion, tfVersion,
 		"run --all plan",
 	)
@@ -182,6 +204,10 @@ func (m *DaggerTerragrunt) Apply(
 	env string,
 	roleArn string,
 	oidcToken *dagger.Secret,
+	// Optional short-lived GitHub App installation token used to clone
+	// private Terraform modules. See Plan() for details.
+	// +optional
+	gitToken *dagger.Secret,
 	// +optional
 	// +default="us-east-2"
 	region string,
@@ -199,7 +225,7 @@ func (m *DaggerTerragrunt) Apply(
 	tfVersion string,
 ) (string, error) {
 	return m.runTerragrunt(
-		ctx, src, env, roleArn, oidcToken,
+		ctx, src, env, roleArn, oidcToken, gitToken,
 		region, sessionName, durationSeconds, tgVersion, tfVersion,
 		// --auto-approve because apply is gated at the GHA environment
 		// level — the human approval happens before this container ever
@@ -230,6 +256,7 @@ func (m *DaggerTerragrunt) runTerragrunt(
 	env string,
 	roleArn string,
 	oidcToken *dagger.Secret,
+	gitToken *dagger.Secret,
 	region string,
 	sessionName string,
 	durationSeconds int,
@@ -274,6 +301,21 @@ func (m *DaggerTerragrunt) runTerragrunt(
 	// a local shell variable and pass it inline. The variable lives only
 	// for the duration of the shell script and is never exported or
 	// logged.
+	//
+	// If a gitToken was provided, we configure an insteadOf rule so that
+	// any `https://github.com/...` clone (including the ones terragrunt
+	// issues to fetch private Terraform module sources) is rewritten to
+	// authenticate with the GitHub App installation token. The token is
+	// embedded in git's in-memory config only; it is not written to a
+	// credential file and is not logged (Dagger scrubs Secret values).
+	gitAuthBlock := ""
+	if gitToken != nil {
+		gitAuthBlock = fmt.Sprintf(`gh_token=$(cat %q)
+git config --global url."https://x-access-token:${gh_token}@github.com/".insteadOf "https://github.com/"
+unset gh_token
+`, gitTokenPath)
+	}
+
 	script := fmt.Sprintf(`set -eu
 oidc_jwt=$(cat %q)
 creds=$(aws sts assume-role-with-web-identity \
@@ -292,15 +334,17 @@ EOF
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 unset creds
 
+%s
 cd %q
 terragrunt --non-interactive %s
 `,
 		oidcTokenPath,
 		roleArn, sessionName, durationSeconds,
+		gitAuthBlock,
 		"./"+env, terragruntCmd,
 	)
 
-	return m.baseContainer(src, tgVersion, tfVersion).
+	c := m.baseContainer(src, tgVersion, tfVersion).
 		WithEnvVariable("AWS_REGION", region).
 		WithEnvVariable("AWS_DEFAULT_REGION", region).
 		// AWS CLI v2 is only needed for plan/apply (not validate), so we
@@ -317,7 +361,13 @@ terragrunt --non-interactive %s
 			"rm -rf /tmp/awscli.zip /tmp/aws && aws --version"}).
 		// Mount OIDC JWT as a tmpfs file. Dagger guarantees the file is
 		// only readable for the lifetime of the exec and is never cached.
-		WithMountedSecret(oidcTokenPath, oidcToken).
+		WithMountedSecret(oidcTokenPath, oidcToken)
+
+	if gitToken != nil {
+		c = c.WithMountedSecret(gitTokenPath, gitToken)
+	}
+
+	return c.
 		WithExec([]string{"sh", "-c", script}).
 		Stdout(ctx)
 }
