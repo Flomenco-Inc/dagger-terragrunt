@@ -385,7 +385,12 @@ terragrunt --non-interactive %s
 	}
 
 	return c.
-		WithExec([]string{"sh", "-c", script}).
+		// bash, not sh. The bootstrap script uses $'\t' for tab-delimiter
+		// IFS splitting and ${VAR:0:N} for diagnostic substrings. Running
+		// under dash (Debian's default /bin/sh) silently produces garbage
+		// AWS session credentials (malformed IFS splitting) AND hard-fails
+		// on the substring expansion with "Bad substitution". Pin bash.
+		WithExec([]string{"bash", "-c", script}).
 		Stdout(ctx)
 }
 
@@ -410,9 +415,15 @@ func (m *DaggerTerragrunt) baseContainer(
 
 	return dag.Container().
 		From("debian:stable-slim").
+		// bash is explicitly installed alongside the usual tooling. The
+		// terragrunt bootstrap script relies on bash-only features
+		// (`$'\t'` ANSI-C quoting for IFS, `${VAR:0:N}` substring
+		// expansion) which dash rejects with "Bad substitution". We could
+		// rewrite in strict POSIX sh, but the script is already complex
+		// enough that depending on bash is cheaper and clearer.
 		WithExec([]string{"sh", "-c", "set -eux; " +
 			"apt-get update && apt-get install -y --no-install-recommends " +
-			"ca-certificates curl unzip git && rm -rf /var/lib/apt/lists/*"}).
+			"ca-certificates curl unzip git bash && rm -rf /var/lib/apt/lists/*"}).
 		WithExec([]string{"sh", "-c", fmt.Sprintf(
 			"set -eux; %s; "+
 				"curl -fsSLo /tmp/tf.zip "+
