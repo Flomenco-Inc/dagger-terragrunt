@@ -78,10 +78,19 @@ Optional:
 - `--duration-seconds` (default `900` — matches the intended
   `MaxSessionDuration` on the plan/apply roles; must be ≤ the role's cap)
 - `--tg-version`, `--tf-version`
+- `--extra-env KEY=VALUE` — repeatable. Forwards the given env var into
+  the terragrunt exec environment so HCL can read it via `get_env(...)`.
+  Intended for plumbing values that shift between plan and apply — for
+  example a `TG_ROLE_VARIANT` flag that a `generate` block uses to pick
+  a plan-role vs apply-role ARN for a cross-account provider alias.
+  Keys starting with `AWS_` are **rejected** — the module owns that
+  namespace (region, access key, session token, etc). Pass sensitive
+  values via `--oidc-token` / `--git-token` instead; `--extra-env` is
+  **not** a secret surface.
 
 ### `apply --src=<dir> --env=<...> --role-arn=<arn> --oidc-token=env:OIDC_TOKEN [opts]`
 
-Same signature as `plan`. Runs
+Same signature as `plan`, including `--extra-env`. Runs
 `terragrunt --non-interactive run --all apply --auto-approve`. **This
 mutates AWS state.** Gate it on a GitHub Actions environment protection rule
 with required reviewers (see CI integration below).

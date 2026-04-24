@@ -56,6 +56,19 @@
 //     as a *Directory argument. The host /.aws/credentials file is never read
 //     or written.
 //
+// # Extra env-var forwarding
+//
+// Both Plan and Apply take an optional repeatable `--extra-env KEY=VALUE`
+// flag that forwards arbitrary env vars into the terragrunt exec. Intended
+// use: terragrunt HCL can `get_env("KEY")` at parse time so a `generate`
+// block can differentiate between plan and apply invocations (eg. to pick
+// a read-only vs write cross-account role ARN for a provider alias).
+//
+// Keys starting with `AWS_` are rejected so callers cannot shadow the
+// module-owned credential + region env vars. `--extra-env` is NOT a
+// Secret-typed surface; sensitive material should still flow through
+// `--oidc-token` / `--git-token`.
+//
 // # Local development
 //
 // Only `validate` works locally without credentials. `plan` and `apply` both
@@ -67,6 +80,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"dagger/dagger-terragrunt/internal/dagger"
 )
@@ -101,6 +115,54 @@ const (
 	// authenticate as the flo-ci app installation.
 	gitTokenPath = "/run/secrets/gh-token"
 )
+
+// reservedExtraEnvPrefixes lists env var prefixes that callers CANNOT
+// inject via --extra-env. The module owns the AWS_* namespace because the
+// assume-role-with-web-identity path exports AWS_ACCESS_KEY_ID /
+// AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN from inside the bootstrap
+// script, and AWS_REGION / AWS_DEFAULT_REGION from the explicit --region
+// flag. Allowing arbitrary AWS_* overrides would let a caller shadow
+// those values and redirect the session to a different account or
+// otherwise corrupt the credential contract.
+var reservedExtraEnvPrefixes = []string{
+	"AWS_",
+}
+
+// parseExtraEnv turns the repeatable `--extra-env KEY=VALUE` flag into a
+// validated map[string]string. Returns an error on malformed entries,
+// empty keys, duplicate keys, or any key that collides with the reserved
+// prefixes the module owns.
+//
+// This is exported only for tests (see main_test.go); callers should not
+// use it directly.
+func parseExtraEnv(pairs []string) (map[string]string, error) {
+	out := make(map[string]string, len(pairs))
+	for _, raw := range pairs {
+		idx := strings.Index(raw, "=")
+		if idx <= 0 {
+			// idx == 0 means empty key ("=VALUE"); idx == -1 means no
+			// delimiter at all. Both are user errors worth flagging.
+			return nil, fmt.Errorf(
+				"extra-env entry %q is not in KEY=VALUE form", raw,
+			)
+		}
+		key := raw[:idx]
+		value := raw[idx+1:]
+		for _, reserved := range reservedExtraEnvPrefixes {
+			if strings.HasPrefix(key, reserved) {
+				return nil, fmt.Errorf(
+					"extra-env key %q uses reserved prefix %q; the module owns this namespace",
+					key, reserved,
+				)
+			}
+		}
+		if _, dup := out[key]; dup {
+			return nil, fmt.Errorf("extra-env key %q specified more than once", key)
+		}
+		out[key] = value
+	}
+	return out, nil
+}
 
 // DaggerTerragrunt is the module's root object. All exported methods are
 // callable as `dagger call <method-name>` from the CLI.
@@ -184,10 +246,27 @@ func (m *DaggerTerragrunt) Plan(
 	// +optional
 	// +default="1.9.8"
 	tfVersion string,
+	// Repeatable KEY=VALUE env-var pairs to forward into the terragrunt
+	// exec. Intended for terragrunt-side `get_env()` reads — for example,
+	// a generate block that picks a cross-account role ARN based on plan
+	// vs apply phase can read `TG_ROLE_VARIANT` here.
+	//
+	// Reserved namespaces: keys starting with AWS_ are rejected. The
+	// module owns the AWS_* namespace because the assume-role path sets
+	// AWS_ACCESS_KEY_ID / _SECRET_ACCESS_KEY / _SESSION_TOKEN / _REGION /
+	// _DEFAULT_REGION; allowing overrides would let a caller shadow those
+	// and redirect the session.
+	//
+	// Not a Secret. Values pass through as-is to the exec's environment.
+	// Sensitive values should continue to flow through --oidc-token /
+	// --git-token (Secret-typed) rather than this flag.
+	// +optional
+	extraEnv []string,
 ) (string, error) {
 	return m.runTerragrunt(
 		ctx, src, env, roleArn, oidcToken, gitToken,
 		region, sessionName, durationSeconds, tgVersion, tfVersion,
+		extraEnv,
 		"run --all plan",
 	)
 }
@@ -223,10 +302,14 @@ func (m *DaggerTerragrunt) Apply(
 	// +optional
 	// +default="1.9.8"
 	tfVersion string,
+	// See Plan() for the extra-env contract.
+	// +optional
+	extraEnv []string,
 ) (string, error) {
 	return m.runTerragrunt(
 		ctx, src, env, roleArn, oidcToken, gitToken,
 		region, sessionName, durationSeconds, tgVersion, tfVersion,
+		extraEnv,
 		// --auto-approve is a Terraform flag, not a Terragrunt flag;
 		// Terragrunt >=0.68 requires forwarding such flags after `--`.
 		// The gate for this mutation is the GHA environment approval
@@ -264,8 +347,13 @@ func (m *DaggerTerragrunt) runTerragrunt(
 	durationSeconds int,
 	tgVersion string,
 	tfVersion string,
+	extraEnv []string,
 	terragruntCmd string,
 ) (string, error) {
+	extraEnvMap, err := parseExtraEnv(extraEnv)
+	if err != nil {
+		return "", err
+	}
 	if region == "" {
 		region = defaultAWSRegion
 	}
@@ -348,7 +436,17 @@ terragrunt --non-interactive %s
 
 	c := m.baseContainer(src, tgVersion, tfVersion).
 		WithEnvVariable("AWS_REGION", region).
-		WithEnvVariable("AWS_DEFAULT_REGION", region).
+		WithEnvVariable("AWS_DEFAULT_REGION", region)
+
+	// Caller-supplied env vars. Applied AFTER the AWS_* envs so a
+	// mis-authored caller cannot accidentally shadow them — parseExtraEnv
+	// rejects AWS_* keys but keeping the application order defensive
+	// too is cheap and makes the invariant visible.
+	for k, v := range extraEnvMap {
+		c = c.WithEnvVariable(k, v)
+	}
+
+	c = c.
 		// AWS CLI v2 is only needed for plan/apply (not validate), so we
 		// install it here rather than in baseContainer. Keeps validate
 		// lean and avoids pulling a ~100MB bundle into a code path that
