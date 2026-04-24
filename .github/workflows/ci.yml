@@ -38,3 +38,6 @@ jobs:
         run: |
           go mod tidy
           go vet ./...
+
+      - name: go test (unit tests for pure-logic helpers)
+        run: go test ./...
