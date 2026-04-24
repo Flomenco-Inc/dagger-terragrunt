@@ -1,14 +1,8 @@
-package main
+package extraenv
 
 import "testing"
 
-// parseExtraEnv is the only piece of pure logic in this module that we can
-// unit-test without the generated Dagger SDK. Everything else is a thin
-// Dagger graph builder whose shape is validated by `dagger functions` in
-// CI. Keeping this test suite limited on purpose — lots of go-test
-// boilerplate for Dagger methods would just duplicate the engine's schema
-// validation.
-func TestParseExtraEnv(t *testing.T) {
+func TestParse(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -68,12 +62,12 @@ func TestParseExtraEnv(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "reserved prefix check is case-sensitive by design (rejects AWS_*)",
+			name:    "reserved prefix check blocks any AWS_*",
 			input:   []string{"AWS_ANYTHING=x"},
 			wantErr: true,
 		},
 		{
-			name:  "lowercase aws_ not reserved",
+			name:  "lowercase aws_ not reserved (case-sensitive by design)",
 			input: []string{"aws_region=us-west-2"},
 			want:  map[string]string{"aws_region": "us-west-2"},
 		},
@@ -82,7 +76,7 @@ func TestParseExtraEnv(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := parseExtraEnv(tc.input)
+			got, err := Parse(tc.input)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got nil (result=%v)", got)

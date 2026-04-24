@@ -80,9 +80,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"dagger/dagger-terragrunt/internal/dagger"
+	"dagger/dagger-terragrunt/internal/extraenv"
 )
 
 // Default tool versions. Single source of truth for Renovate bumps.
@@ -115,54 +115,6 @@ const (
 	// authenticate as the flo-ci app installation.
 	gitTokenPath = "/run/secrets/gh-token"
 )
-
-// reservedExtraEnvPrefixes lists env var prefixes that callers CANNOT
-// inject via --extra-env. The module owns the AWS_* namespace because the
-// assume-role-with-web-identity path exports AWS_ACCESS_KEY_ID /
-// AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN from inside the bootstrap
-// script, and AWS_REGION / AWS_DEFAULT_REGION from the explicit --region
-// flag. Allowing arbitrary AWS_* overrides would let a caller shadow
-// those values and redirect the session to a different account or
-// otherwise corrupt the credential contract.
-var reservedExtraEnvPrefixes = []string{
-	"AWS_",
-}
-
-// parseExtraEnv turns the repeatable `--extra-env KEY=VALUE` flag into a
-// validated map[string]string. Returns an error on malformed entries,
-// empty keys, duplicate keys, or any key that collides with the reserved
-// prefixes the module owns.
-//
-// This is exported only for tests (see main_test.go); callers should not
-// use it directly.
-func parseExtraEnv(pairs []string) (map[string]string, error) {
-	out := make(map[string]string, len(pairs))
-	for _, raw := range pairs {
-		idx := strings.Index(raw, "=")
-		if idx <= 0 {
-			// idx == 0 means empty key ("=VALUE"); idx == -1 means no
-			// delimiter at all. Both are user errors worth flagging.
-			return nil, fmt.Errorf(
-				"extra-env entry %q is not in KEY=VALUE form", raw,
-			)
-		}
-		key := raw[:idx]
-		value := raw[idx+1:]
-		for _, reserved := range reservedExtraEnvPrefixes {
-			if strings.HasPrefix(key, reserved) {
-				return nil, fmt.Errorf(
-					"extra-env key %q uses reserved prefix %q; the module owns this namespace",
-					key, reserved,
-				)
-			}
-		}
-		if _, dup := out[key]; dup {
-			return nil, fmt.Errorf("extra-env key %q specified more than once", key)
-		}
-		out[key] = value
-	}
-	return out, nil
-}
 
 // DaggerTerragrunt is the module's root object. All exported methods are
 // callable as `dagger call <method-name>` from the CLI.
@@ -350,7 +302,7 @@ func (m *DaggerTerragrunt) runTerragrunt(
 	extraEnv []string,
 	terragruntCmd string,
 ) (string, error) {
-	extraEnvMap, err := parseExtraEnv(extraEnv)
+	extraEnvMap, err := extraenv.Parse(extraEnv)
 	if err != nil {
 		return "", err
 	}
@@ -439,7 +391,7 @@ terragrunt --non-interactive %s
 		WithEnvVariable("AWS_DEFAULT_REGION", region)
 
 	// Caller-supplied env vars. Applied AFTER the AWS_* envs so a
-	// mis-authored caller cannot accidentally shadow them — parseExtraEnv
+	// mis-authored caller cannot accidentally shadow them — extraenv.Parse
 	// rejects AWS_* keys but keeping the application order defensive
 	// too is cheap and makes the invariant visible.
 	for k, v := range extraEnvMap {
