@@ -87,13 +87,57 @@ Optional:
   namespace (region, access key, session token, etc). Pass sensitive
   values via `--oidc-token` / `--git-token` instead; `--extra-env` is
   **not** a secret surface.
+- `--leaf <subpath>` — optional. Scopes terragrunt to a single leaf
+  under `<env>/<leaf>` and drops the `run --all` wrapper. When omitted
+  (default), behavior is unchanged: `run-all` across the full env
+  graph. When set, terragrunt runs plain `plan` / `apply` in the named
+  leaf and reads dependency outputs from remote state without
+  re-initializing ancestor leaves. See
+  [Leaf-scoped redeploy](#leaf-scoped-redeploy) below for when to use
+  this. Path guardrails: `..` and leading `/` are rejected.
 
 ### `apply --src=<dir> --env=<...> --role-arn=<arn> --oidc-token=env:OIDC_TOKEN [opts]`
 
-Same signature as `plan`, including `--extra-env`. Runs
-`terragrunt --non-interactive run --all apply --auto-approve`. **This
-mutates AWS state.** Gate it on a GitHub Actions environment protection rule
-with required reviewers (see CI integration below).
+Same signature as `plan`, including `--extra-env` and `--leaf`. Runs
+`terragrunt --non-interactive run --all apply --auto-approve`, or the
+leaf-scoped variant when `--leaf` is set. **This mutates AWS state.**
+Gate it on a GitHub Actions environment protection rule with required
+reviewers (see CI integration below).
+
+### Leaf-scoped redeploy
+
+`terragrunt run-all` initializes every leaf under `<env>/` on every
+invocation, even when only one leaf's state could have changed. For a
+five-leaf dev env that's ~60-90s of pure overhead on every re-apply.
+Passing `--leaf=<name>` collapses the call to a single-dir
+`terragrunt apply`, reading dependency outputs from remote state
+without re-planning ancestors.
+
+When to reach for this:
+
+- Image-only redeploys — the webapp/api/worker leaf picks up a new
+  ECR digest on re-apply, but nothing else in the env has changed.
+- Tuning a single leaf's inputs post-initial-apply.
+
+When NOT to:
+
+- First apply of a new env. `--leaf` assumes dependencies have
+  remote state to read; use run-all for the initial build-out.
+- Changes that affect the DAG (adding new deps, reshaping outputs).
+  Run-all validates the whole graph; `--leaf` won't catch drift in
+  other leaves.
+
+Example — the flo monorepo's webapp container build triggers
+leaf-scoped re-applies on the webapp leaf only, avoiding the
+run-all overhead on every image bump:
+
+```bash
+dagger call -m github.com/Flomenco-Inc/dagger-terragrunt@v0.5.0 \
+  apply --src=. --env=envs/dev/us-east-1 --leaf=webapp \
+    --role-arn=arn:aws:iam::<acct>:role/gha-core-services-apply \
+    --oidc-token=env://OIDC_TOKEN \
+    --git-token=env://GH_TOKEN
+```
 
 ## Why the env split is positional, not auto-detected
 
@@ -356,3 +400,12 @@ Release history:
 - `v0.2.0` — add optional `--git-token` Secret parameter for authenticated
   cloning of private Terraform modules via a GitHub App installation
   token. Backwards-compatible for callers that only use public modules.
+- `v0.3.0` — strip the v0.1.1 diagnostic logging now that the secret-mount
+  path is proven stable in production.
+- `v0.4.0` — add repeatable `--extra-env KEY=VALUE` flag for forwarding
+  arbitrary env vars to the terragrunt exec (`get_env()` reads in HCL).
+  `AWS_*` keys rejected at the boundary.
+- `v0.5.0` — add optional `--leaf <subpath>` flag that scopes plan/apply
+  to a single leaf under `<env>/<leaf>` (no `run --all`). Intended for
+  image-only redeploys where re-initializing every other leaf is pure
+  overhead. Backwards-compatible — unset `--leaf` behaves as before.

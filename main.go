@@ -80,6 +80,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"dagger/dagger-terragrunt/internal/dagger"
 	"dagger/dagger-terragrunt/internal/extraenv"
@@ -214,11 +215,26 @@ func (m *DaggerTerragrunt) Plan(
 	// --git-token (Secret-typed) rather than this flag.
 	// +optional
 	extraEnv []string,
+	// Optional subpath under `--env` that scopes terragrunt to a single
+	// leaf. When set, terragrunt runs plain `plan` (no `run --all`) in
+	// `<env>/<leaf>`, reading dependency outputs from remote state
+	// without re-planning ancestors. When empty (default), terragrunt
+	// runs `run --all plan` across the full env graph as before.
+	//
+	// Used by image-only redeploy workflows where re-initializing every
+	// other leaf in the env is pure overhead. See the flo-core-services
+	// apply-webapp.yml workflow for the canonical consumer.
+	//
+	// Must not contain `..` or a leading `/`. Nested subpaths (eg.
+	// `service-v2/subscription-service`) ARE allowed for future leaf
+	// hierarchies.
+	// +optional
+	leaf string,
 ) (string, error) {
 	return m.runTerragrunt(
 		ctx, src, env, roleArn, oidcToken, gitToken,
 		region, sessionName, durationSeconds, tgVersion, tfVersion,
-		extraEnv,
+		extraEnv, leaf,
 		"run --all plan",
 	)
 }
@@ -257,11 +273,22 @@ func (m *DaggerTerragrunt) Apply(
 	// See Plan() for the extra-env contract.
 	// +optional
 	extraEnv []string,
+	// Optional subpath under `--env` that scopes terragrunt to a single
+	// leaf. When set, terragrunt runs plain `apply -- -auto-approve`
+	// (no `run --all`) in `<env>/<leaf>`. See Plan() for the full
+	// rationale + path constraints.
+	//
+	// Dependencies are NOT re-applied; their outputs are read from
+	// remote state. This mode assumes the full env has been applied at
+	// least once via run-all; using --leaf against an unbuilt env will
+	// fail at dependency resolution.
+	// +optional
+	leaf string,
 ) (string, error) {
 	return m.runTerragrunt(
 		ctx, src, env, roleArn, oidcToken, gitToken,
 		region, sessionName, durationSeconds, tgVersion, tfVersion,
-		extraEnv,
+		extraEnv, leaf,
 		// --auto-approve is a Terraform flag, not a Terragrunt flag;
 		// Terragrunt >=0.68 requires forwarding such flags after `--`.
 		// The gate for this mutation is the GHA environment approval
@@ -300,6 +327,7 @@ func (m *DaggerTerragrunt) runTerragrunt(
 	tgVersion string,
 	tfVersion string,
 	extraEnv []string,
+	leaf string,
 	terragruntCmd string,
 ) (string, error) {
 	extraEnvMap, err := extraenv.Parse(extraEnv)
@@ -330,6 +358,32 @@ func (m *DaggerTerragrunt) runTerragrunt(
 	}
 	if env == "" {
 		return "", fmt.Errorf("env is required")
+	}
+
+	// When --leaf is set, scope terragrunt to a single leaf dir (no
+	// run-all). This is the image-only-redeploy optimization: reading
+	// an env's full DAG costs ~60-90s of init on every re-apply even
+	// when only one leaf's state could have changed. With --leaf,
+	// terragrunt only initializes the named leaf and reads its deps'
+	// outputs from remote state.
+	//
+	// Guardrails on the subpath: no `..` (prevents traversing out of
+	// the env), no leading `/` (prevents absolute paths escaping the
+	// source mount). Nested relative subpaths are allowed for forward
+	// compatibility with multi-leaf service hierarchies (eg.
+	// service-v2/subscription-service).
+	cdPath := "./" + env
+	if leaf != "" {
+		if strings.Contains(leaf, "..") {
+			return "", fmt.Errorf("leaf must not contain '..': got %q", leaf)
+		}
+		if strings.HasPrefix(leaf, "/") {
+			return "", fmt.Errorf("leaf must be a relative subpath, not absolute: got %q", leaf)
+		}
+		cdPath = "./" + env + "/" + leaf
+		// Strip the run-all prefix so we get `terragrunt plan` /
+		// `terragrunt apply -- -auto-approve` in a single dir.
+		terragruntCmd = strings.TrimPrefix(terragruntCmd, "run --all ")
 	}
 
 	// Build the bootstrap shell script that runs assume-role-with-web-identity
@@ -383,7 +437,7 @@ terragrunt --non-interactive %s
 		oidcTokenPath,
 		roleArn, sessionName, durationSeconds,
 		gitAuthBlock,
-		"./"+env, terragruntCmd,
+		cdPath, terragruntCmd,
 	)
 
 	c := m.baseContainer(src, tgVersion, tfVersion).
