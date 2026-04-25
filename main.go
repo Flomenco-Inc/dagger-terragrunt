@@ -230,12 +230,37 @@ func (m *DaggerTerragrunt) Plan(
 	// hierarchies.
 	// +optional
 	leaf string,
+	// When true (default), the verbose terragrunt+terraform plan stdout
+	// is captured to a container-side log file and a compact per-leaf
+	// summary is emitted on the function's stdout instead. The summary
+	// lists resource-level actions (create/update/replace/destroy) with
+	// addresses but DOES NOT include attribute diff bodies.
+	//
+	// Why this matters: terraform's diff renderer prints the full value
+	// of every changed attribute, including multi-line string values
+	// like `aws_api_gateway_rest_api.body = yamlencode(<merged-openapi>)`.
+	// As the API surface grows that body grows linearly, and a single
+	// PR plan can balloon to multiple MB. GitHub Actions caps step output
+	// (1 MB), step log streams (~4 MB), and overall job logs (~50 MB).
+	// Past a few services, raw plan output starts crashing the runner
+	// with "Maximum object size exceeded" before the plan even surfaces.
+	//
+	// On plan FAILURE, the full captured log is emitted regardless of
+	// this flag — operators always need to see the failure diagnostics.
+	//
+	// Set --summarize=false to restore the legacy verbose stream — useful
+	// when debugging an unexpected attribute diff in a small plan where
+	// the verbose output is still tractable.
+	// +optional
+	// +default=true
+	summarize bool,
 ) (string, error) {
 	return m.runTerragrunt(
 		ctx, src, env, roleArn, oidcToken, gitToken,
 		region, sessionName, durationSeconds, tgVersion, tfVersion,
 		extraEnv, leaf,
 		"run --all plan",
+		summarize,
 	)
 }
 
@@ -296,6 +321,13 @@ func (m *DaggerTerragrunt) Apply(
 		// runs. If that gate is removed, --auto-approve must be removed
 		// too or nothing gates.
 		"run --all apply -- -auto-approve",
+		// summarize=false on apply: the per-resource progress messages
+		// terraform prints during apply are operationally useful (when
+		// did each resource start, did it block, did it retry?) and
+		// they don't carry the attribute-diff bodies that bloat plan
+		// output. If apply output ever does grow past runner caps, we
+		// can revisit by parsing terraform's apply -json output stream.
+		false,
 	)
 }
 
@@ -329,6 +361,7 @@ func (m *DaggerTerragrunt) runTerragrunt(
 	extraEnv []string,
 	leaf string,
 	terragruntCmd string,
+	summarize bool,
 ) (string, error) {
 	extraEnvMap, err := extraenv.Parse(extraEnv)
 	if err != nil {
@@ -412,6 +445,113 @@ unset gh_token
 `, gitTokenPath)
 	}
 
+	// When summarizing a plan we splice `-out=tfplan.bin` onto the
+	// terragrunt command and post-process. terragrunt forwards trailing
+	// flags after `--` to terraform; the existing apply path uses the
+	// same convention with `-auto-approve`.
+	terragruntCmdEffective := terragruntCmd
+	tgCmdBlock := fmt.Sprintf("terragrunt --non-interactive %s\n", terragruntCmdEffective)
+	if summarize {
+		// Inject -out=tfplan.bin BEFORE any existing `--` so we end up
+		// with eg. `run --all plan -- -out=tfplan.bin` regardless of
+		// run-all vs leaf-scoped vs whatever caller arg shape.
+		if strings.Contains(terragruntCmdEffective, " -- ") {
+			terragruntCmdEffective = strings.Replace(
+				terragruntCmdEffective, " -- ", " -- -out=tfplan.bin ", 1)
+		} else {
+			terragruntCmdEffective = terragruntCmdEffective + " -- -out=tfplan.bin"
+		}
+		// On success, walk every plan binary terragrunt produced and
+		// emit a per-leaf compact summary via `terraform show -json`.
+		// The full verbose plan stays in /tmp/plan.log inside the
+		// container — invisible from outside, which is the goal here.
+		// On failure we cat the full log so operators see diagnostics.
+		//
+		// Why per-leaf walking instead of `terragrunt run-all show`:
+		// run-all show would re-emit the same verbose textual plan we
+		// just suppressed. We need the JSON form, which run-all does
+		// not pass through cleanly. Walking the cache dirs and calling
+		// terraform directly gets us deterministic JSON with no extra
+		// terragrunt overhead.
+		// Bash script structure:
+		//   1. run terragrunt plan, redirecting both streams to a tmp
+		//      log file so the verbose body diffs don't reach stdout
+		//   2. on plan failure, cat the log + exit 1
+		//   3. on success, walk every tfplan.bin under cwd, run
+		//      `terraform show -no-color -json tfplan.bin` per-leaf,
+		//      emit a per-leaf header + counts + per-resource action
+		//      lines, then totals across all leaves
+		//
+		// jq filters:
+		//   - per-resource line: skip no-op + read-only actions
+		//   - replace count: an action list that includes both "create"
+		//     AND "delete" (terraform plans replacements as
+		//     ["delete","create"] or ["create","delete"] depending on
+		//     create_before_destroy)
+		//
+		// Subshell-from-pipe trap: `find ... | while read` runs the
+		// while body in a subshell, so accumulator variables don't
+		// survive. We avoid that by writing the find output to a tmp
+		// file and looping with `< "$plans_list"`.
+		tgCmdBlock = fmt.Sprintf(`plan_log=$(mktemp)
+plans_list=$(mktemp)
+trap 'rm -f "$plan_log" "$plans_list"' EXIT
+if ! terragrunt --non-interactive %s > "$plan_log" 2>&1; then
+  echo "::error::terragrunt plan failed; full log follows" >&2
+  cat "$plan_log"
+  exit 1
+fi
+
+find . -name tfplan.bin -type f | sort > "$plans_list"
+if ! [ -s "$plans_list" ]; then
+  echo "=== Plan summary ==="
+  echo "(no plan files produced — nothing to apply)"
+  exit 0
+fi
+
+leaf_count=$(wc -l < "$plans_list" | tr -d ' ')
+echo "=== Plan summary across $leaf_count leaves (pass --summarize=false for full diff) ==="
+echo
+
+while IFS= read -r p; do
+  # Strip leading ./ then everything from /.terragrunt-cache/ onward
+  # to get a stable per-leaf label like envs/dev/us-east-1/auth.
+  leaf_label=$(echo "$p" | sed -E 's|^\./||; s|/\.terragrunt-cache/.*||')
+  json=$(cd "$(dirname "$p")" && terraform show -no-color -json tfplan.bin)
+  echo "--- $leaf_label"
+  echo "$json" | jq -r '
+    (.resource_changes // []) as $rc
+    | ($rc | map(select(.change.actions == ["create"])) | length) as $c
+    | ($rc | map(select(.change.actions == ["update"])) | length) as $u
+    | ($rc | map(select(.change.actions | (contains(["delete"]) and contains(["create"]))))
+            | length) as $r
+    | ($rc | map(select(.change.actions == ["delete"])) | length) as $d
+    | "  " + ($c|tostring) + " create / " + ($u|tostring) + " update / "
+            + ($r|tostring) + " replace / " + ($d|tostring) + " destroy",
+      ($rc[]
+       | select(.change.actions != ["no-op"])
+       | select(.change.actions != ["read"])
+       | "    " + (.change.actions | join("+")) + "  " + .address)'
+done < "$plans_list"
+
+# Totals: re-walk plans_list and concatenate JSON, then a single jq
+# pass aggregates across leaves. Cheap (each plan binary is small)
+# and avoids accumulator-state-in-subshell pitfalls.
+echo
+echo "=== Totals ==="
+while IFS= read -r p; do
+  ( cd "$(dirname "$p")" && terraform show -no-color -json tfplan.bin )
+done < "$plans_list" | jq -s -r '
+  [.[].resource_changes[]?] as $all
+  | "  create:  " + ([$all[] | select(.change.actions == ["create"])] | length | tostring),
+    "  update:  " + ([$all[] | select(.change.actions == ["update"])] | length | tostring),
+    "  replace: " + ([$all[] | select(.change.actions
+                                     | (contains(["delete"]) and contains(["create"])))]
+                              | length | tostring),
+    "  destroy: " + ([$all[] | select(.change.actions == ["delete"])] | length | tostring)'
+`, terragruntCmdEffective)
+	}
+
 	script := fmt.Sprintf(`set -eu
 oidc_jwt=$(cat %q)
 creds=$(aws sts assume-role-with-web-identity \
@@ -432,12 +572,11 @@ unset creds
 
 %s
 cd %q
-terragrunt --non-interactive %s
-`,
+%s`,
 		oidcTokenPath,
 		roleArn, sessionName, durationSeconds,
 		gitAuthBlock,
-		cdPath, terragruntCmd,
+		cdPath, tgCmdBlock,
 	)
 
 	c := m.baseContainer(src, tgVersion, tfVersion).
@@ -513,7 +652,11 @@ func (m *DaggerTerragrunt) baseContainer(
 		// enough that depending on bash is cheaper and clearer.
 		WithExec([]string{"sh", "-c", "set -eux; " +
 			"apt-get update && apt-get install -y --no-install-recommends " +
-			"ca-certificates curl unzip git bash && rm -rf /var/lib/apt/lists/*"}).
+			// jq is used by the plan summarize path in runTerragrunt to
+			// turn `terraform show -json tfplan.bin` into a compact
+			// per-leaf changeset list. Cheap (~600 KB), pinned via
+			// debian:stable-slim's package set.
+			"ca-certificates curl unzip git bash jq && rm -rf /var/lib/apt/lists/*"}).
 		WithExec([]string{"sh", "-c", fmt.Sprintf(
 			"set -eux; %s; "+
 				"curl -fsSLo /tmp/tf.zip "+

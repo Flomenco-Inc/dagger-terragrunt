@@ -95,6 +95,14 @@ Optional:
   re-initializing ancestor leaves. See
   [Leaf-scoped redeploy](#leaf-scoped-redeploy) below for when to use
   this. Path guardrails: `..` and leading `/` are rejected.
+- `--summarize` (plan only, default `true`) — when true, the verbose
+  terraform plan stdout is captured to a container-side log file and a
+  compact per-leaf summary is emitted instead. Lists resource-level
+  actions (create / update / replace / destroy) with addresses but
+  omits attribute diff bodies. See
+  [Plan summarization](#plan-summarization) below for why this
+  matters. Pass `--summarize=false` to restore the legacy verbose
+  stream when debugging an unexpected diff in a small plan.
 
 ### `apply --src=<dir> --env=<...> --role-arn=<arn> --oidc-token=env:OIDC_TOKEN [opts]`
 
@@ -103,6 +111,45 @@ Same signature as `plan`, including `--extra-env` and `--leaf`. Runs
 leaf-scoped variant when `--leaf` is set. **This mutates AWS state.**
 Gate it on a GitHub Actions environment protection rule with required
 reviewers (see CI integration below).
+
+### Plan summarization
+
+`terragrunt run-all plan` calls `terraform plan` per leaf, and
+terraform's diff renderer prints the full value of every changed
+attribute. That includes multi-line strings — and the API Gateway
+leaves in flo-core-services use
+`aws_api_gateway_rest_api.body = yamlencode(<merged-openapi>)`, which
+grows linearly with the number of services on the API. With ~7
+services merged the body diff alone is multiple MB.
+
+GitHub Actions caps step output at ~1 MB and step log streams at a
+few MB. Past a handful of services the raw plan output crashes the
+runner with `Maximum object size exceeded` before reviewers ever see
+the plan. We hit this in flo-core-services around the time we
+migrated the third Tier-1 service.
+
+`--summarize=true` (the default) gives the module's stdout a fixed
+output budget independent of the plan body. The flow:
+
+1. `terragrunt run-all plan -- -out=tfplan.bin` runs with both
+   stdout and stderr redirected to `/tmp/plan.log` inside the
+   container — never reaches the dagger output stream.
+2. On plan failure, the full captured log is emitted (and exit
+   non-zero) — operators always need failure diagnostics.
+3. On success, the module walks every `tfplan.bin` produced under
+   the env tree, runs `terraform show -no-color -json tfplan.bin`
+   per-leaf, and emits a compact summary: per-leaf header,
+   create/update/replace/destroy counts, per-resource action lines
+   (`address` + action), then totals across all leaves.
+
+Output scales with `O(num_resources_changing)`, not
+`O(sum_of_attribute_body_sizes)`. A 5-leaf 200-resource plan emits
+roughly 250 lines instead of 30k+.
+
+If the summary ever loses information you need (e.g. a specific
+attribute change was the cause of a regression and the diff is
+needed for triage), pass `--summarize=false` for that one
+invocation to restore the verbose stream.
 
 ### Leaf-scoped redeploy
 
@@ -409,3 +456,11 @@ Release history:
   to a single leaf under `<env>/<leaf>` (no `run --all`). Intended for
   image-only redeploys where re-initializing every other leaf is pure
   overhead. Backwards-compatible — unset `--leaf` behaves as before.
+- `v0.6.0` — `plan` gets a `--summarize` flag (default `true`) that
+  captures the verbose terragrunt plan output internally and emits a
+  compact per-leaf changeset summary instead. Avoids GitHub Actions
+  runner output size caps as the API surface grows (large
+  `aws_api_gateway_rest_api.body` yamlencoded openapi diffs are the
+  primary trigger). Pass `--summarize=false` to restore legacy
+  verbose stream. Adds `jq` to the base container image. Apply path
+  unchanged.
