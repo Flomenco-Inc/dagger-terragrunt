@@ -517,21 +517,26 @@ while IFS= read -r p; do
   # Strip leading ./ then everything from /.terragrunt-cache/ onward
   # to get a stable per-leaf label like envs/dev/us-east-1/auth.
   leaf_label=$(echo "$p" | sed -E 's|^\./||; s|/\.terragrunt-cache/.*||')
-  json=$(cd "$(dirname "$p")" && terraform show -no-color -json tfplan.bin)
   echo "--- $leaf_label"
-  echo "$json" | jq -r '
+  json_file=$(mktemp)
+  show_err=$(mktemp)
+  ( cd "$(dirname "$p")" && terraform show -no-color -json tfplan.bin ) >"$json_file" 2>"$show_err" || true
+  if ! [ -s "$json_file" ]; then
+    echo "  [warn] empty terraform-show JSON for $p; stderr follows:"
+    sed 's/^/    /' "$show_err"
+    rm -f "$json_file" "$show_err"
+    continue
+  fi
+  jq -r '
     (.resource_changes // []) as $rc
-    | ($rc | map(select(.change.actions == ["create"])) | length) as $c
-    | ($rc | map(select(.change.actions == ["update"])) | length) as $u
-    | ($rc | map(select(.change.actions | (contains(["delete"]) and contains(["create"]))))
-            | length) as $r
-    | ($rc | map(select(.change.actions == ["delete"])) | length) as $d
-    | "  " + ($c|tostring) + " create / " + ($u|tostring) + " update / "
-            + ($r|tostring) + " replace / " + ($d|tostring) + " destroy",
+    | "  " + ([$rc[]|select(.change.actions==["create"])]|length|tostring)  + " create / "
+            + ([$rc[]|select(.change.actions==["update"])]|length|tostring) + " update / "
+            + ([$rc[]|select(.change.actions|(contains(["delete"]) and contains(["create"])))]|length|tostring) + " replace / "
+            + ([$rc[]|select(.change.actions==["delete"])]|length|tostring) + " destroy",
       ($rc[]
-       | select(.change.actions != ["no-op"])
-       | select(.change.actions != ["read"])
-       | "    " + (.change.actions | join("+")) + "  " + .address)'
+       | select(.change.actions!=["no-op"] and .change.actions!=["read"])
+       | "    " + (.change.actions|join("+")) + "  " + .address)' "$json_file"
+  rm -f "$json_file" "$show_err"
 done < "$plans_list"
 
 # Totals: re-walk plans_list and concatenate JSON, then a single jq
