@@ -614,7 +614,13 @@ cd %q
 		WithMountedSecret(oidcTokenPath, oidcToken)
 
 	if gitToken != nil {
-		c = c.WithMountedSecret(gitTokenPath, gitToken)
+		c = c.WithMountedSecret(gitTokenPath, gitToken).
+			// Expose the token as TF_VAR_github_token so that terraform
+			// data.http resources (e.g. github.tf in terraform-aws-service-v2)
+			// can authenticate against the GitHub Contents API. The git
+			// insteadOf config only covers module cloning; it does not help
+			// providers that issue their own HTTP requests.
+			WithSecretVariable("TF_VAR_github_token", gitToken)
 	}
 
 	return c.
