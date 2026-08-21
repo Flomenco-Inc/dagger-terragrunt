@@ -23,5 +23,11 @@ jobs:
       - name: Verify Claude Code bridges
         run: |
           set -eu
-          chmod +x scripts/check-claude-bridges.sh
+          chmod +x scripts/check-claude-bridges.sh scripts/gen-claude-bridges.sh
           ./scripts/check-claude-bridges.sh
+          # Idempotency lock: re-gen must be a no-op (Grok finding on flo#1565)
+          ./scripts/gen-claude-bridges.sh
+          if ! git diff --exit-code -- '**/CLAUDE.md' 'CLAUDE.md'; then
+            echo "::error::gen-claude-bridges.sh is not idempotent — CLAUDE.md changed after re-run"
+            exit 1
+          fi
