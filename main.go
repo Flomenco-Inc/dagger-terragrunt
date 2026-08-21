@@ -607,6 +607,16 @@ oidc_refresh_pid=$!
 	script := fmt.Sprintf(`set -eu
 install -m 600 %q %q
 ln -s %q %q
+oidc_refresh_pid=""
+cleanup_oidc_refresh() {
+  if [ -n "${oidc_refresh_pid}" ]; then
+    kill "${oidc_refresh_pid}" 2>/dev/null || true
+    wait "${oidc_refresh_pid}" 2>/dev/null || true
+  fi
+}
+trap 'cleanup_oidc_refresh' EXIT
+%s
+
 oidc_jwt=$(cat %q)
 creds=$(aws sts assume-role-with-web-identity \
   --role-arn %q \
@@ -624,24 +634,14 @@ EOF
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 unset creds
 
-oidc_refresh_pid=""
-cleanup_oidc_refresh() {
-  if [ -n "${oidc_refresh_pid}" ]; then
-    kill "${oidc_refresh_pid}" 2>/dev/null || true
-    wait "${oidc_refresh_pid}" 2>/dev/null || true
-  fi
-}
-%s
-trap 'cleanup_oidc_refresh' EXIT
-
 %s
 cd %q
 %s`,
 		oidcInitialTokenPath, oidcMutableTokenPath,
 		oidcMutableTokenPath, oidcTokenPath,
+		oidcRefreshBlock,
 		oidcTokenPath,
 		roleArn, sessionName, durationSeconds,
-		oidcRefreshBlock,
 		gitAuthBlock,
 		cdPath, tgCmdBlock,
 	)
