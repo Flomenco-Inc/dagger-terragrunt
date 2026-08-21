@@ -25,18 +25,30 @@ accident.
 
 ## Credential contract
 
-The module accepts **exactly two** credential-shaped inputs at its public
-API boundary:
+The module accepts **exactly two** required credential-shaped inputs at
+its public API boundary:
 
 1. `--role-arn` — plain string. The IAM role ARN in the target AWS account.
 2. `--oidc-token` — `*dagger.Secret`. A GitHub Actions-minted JWT for the
    `sts.amazonaws.com` audience.
 
-Inside the container (`runTerragrunt` in `main.go`) the token is mounted
+Optional (v0.6.3+, required for long Flo applies with aliased providers):
+
+3. `--oidc-request-token` + `--oidc-request-url` — GitHub
+   `ACTIONS_ID_TOKEN_REQUEST_*`. When both are set, the container copies
+   the JWT to writable `/run/oidc/token`, symlinks `/run/secrets/oidc-token`,
+   refreshes once before the first STS exchange, then every 5 minutes.
+   Terraform `web_identity_token_file` readers then see a live JWT.
+
+Inside the container (`runTerragrunt` in `main.go`) the token is available
 at `/run/secrets/oidc-token` and exchanged via
 `aws sts assume-role-with-web-identity` for temporary session credentials.
 Those credentials are exported as env vars **for the single terragrunt
 exec only** and never logged, never cached, never returned to the caller.
+
+**Mount rule:** never `WithMountedTemp("/run/secrets")` and nest
+`WithMountedSecret` under that path — parent tmpfs hides child secrets.
+See `.cursor/rules/oidc-jwt-refresh.mdc`.
 
 This design is non-negotiable:
 
@@ -98,10 +110,11 @@ credentials exist only for the duration of one `WithExec` call.
 - **Do not print `$creds` or any intermediate shell variable** inside the
   runTerragrunt script. The script deliberately uses `set -eu` (not `-x`)
   to avoid tracing the sts exchange line.
-- **Do not bump `--duration-seconds` default above 900.** The IAM role's
-  `MaxSessionDuration` should cap it at 900 anyway, but the default is
-  belt-and-suspenders. Longer-lived session creds = larger blast radius
-  if the JWT or intermediate container layer leaks.
+- **Do not bump `--duration-seconds` default above 900.** Callers with
+  long `run-all` / full `service-v2` pass `--duration-seconds=14400`
+  explicitly. Raising the module default widens blast radius for every
+  consumer. JWT refresh (request-token/url) is a separate axis from STS
+  session length.
 
 ## Local testing
 
