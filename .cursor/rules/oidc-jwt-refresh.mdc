@@ -1,0 +1,28 @@
+---
+description: In-container GitHub OIDC JWT refresh and Dagger secret mount rules
+globs: main.go
+alwaysApply: true
+---
+
+# OIDC JWT refresh inside dagger-terragrunt
+
+GitHub OIDC JWTs live ~15 minutes. Terraform aliased providers (`assume_role_with_web_identity` + `web_identity_token_file`) re-read the file at **lazy provider init**, which can be tens of minutes after the first STS exchange.
+
+## Required design (v0.6.3+)
+
+- Public API still takes `--oidc-token` (`*dagger.Secret`).
+- Optional `--oidc-request-token` + `--oidc-request-url` (GitHub `ACTIONS_ID_TOKEN_REQUEST_*`). When both are set, copy the JWT to a **writable** tmpfs file `/run/oidc/token`, symlink `/run/secrets/oidc-token`, refresh once before the first `AssumeRoleWithWebIdentity`, then every 5 minutes.
+- Keep default `--duration-seconds` at **900**. Callers that run long `run-all` / full `service-v2` pass `14400`. Do not raise the module default.
+
+## Mount rule (do not regress)
+
+Never `WithMountedTemp("/run/secrets")` and then nest `WithMountedSecret` under that directory. A parent tmpfs **hides** child secret mounts at runtime even if `dagger call` looks correct.
+
+Wrong: temp-mount `/run/secrets`, then secret-mount `oidc-token` into it.
+Right: temp-mount `/run/oidc` for the mutable copy; secret-mounts stay as Dagger secrets; symlink the stable path Terraform already uses.
+
+## What NOT to do
+
+- Do not add `AWS_ACCESS_KEY_ID` / static-key inputs.
+- Do not document “JWT is discarded after first STS” as still true when request-token/url are passed.
+- Do not nest secret mounts under a parent `WithMountedTemp`.
