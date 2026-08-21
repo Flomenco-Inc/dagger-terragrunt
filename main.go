@@ -583,24 +583,23 @@ done < "$plans_list" | jq -s -r '
 
 	oidcRefreshBlock := ""
 	if oidcRequestToken != nil {
-		oidcRefreshBlock = fmt.Sprintf(`refresh_oidc_token() {
-  while sleep 300; do
-    request_token=$(cat %q)
-    token_tmp=$(mktemp /run/oidc/token.XXXXXX)
-    if curl -sS --fail --max-time 30 \
-      -H "Authorization: Bearer ${request_token}" \
-      "${OIDC_REQUEST_URL}&audience=sts.amazonaws.com" \
-      | jq -er '.value // empty' > "${token_tmp}"; then
-      chmod 600 "${token_tmp}"
-      mv "${token_tmp}" %q
-    else
-      rm -f "${token_tmp}"
-      echo "warning: GitHub OIDC refresh failed; retrying in five minutes" >&2
-    fi
-    unset request_token
-  done
+		oidcRefreshBlock = fmt.Sprintf(`refresh_oidc_token_once() {
+  request_token=$(cat %q)
+  token_tmp=$(mktemp /run/oidc/token.XXXXXX)
+  if curl -sS --fail --max-time 30 \
+    -H "Authorization: Bearer ${request_token}" \
+    "${OIDC_REQUEST_URL}&audience=sts.amazonaws.com" \
+    | jq -er '.value // empty' > "${token_tmp}"; then
+    chmod 600 "${token_tmp}"
+    mv "${token_tmp}" %q
+  else
+    rm -f "${token_tmp}"
+    echo "warning: GitHub OIDC refresh failed; retrying in five minutes" >&2
+  fi
+  unset request_token
 }
-refresh_oidc_token &
+refresh_oidc_token_once
+( while sleep 300; do refresh_oidc_token_once; done ) &
 oidc_refresh_pid=$!
 `, oidcRequestTokenPath, oidcMutableTokenPath)
 	}
