@@ -17,6 +17,8 @@ accepted at the public API boundary is:
 
 - `--role-arn` — the IAM role in the target AWS account.
 - `--oidc-token` — a short-lived GitHub Actions OIDC JWT (`Secret`).
+- `--oidc-request-token` + `--oidc-request-url` — optional GitHub Actions
+  credentials used together to refresh that JWT during long executions.
 - `--git-token` — **optional** short-lived GitHub App installation token
   (`Secret`) used to clone private Terraform module repos referenced by
   terragrunt. Mint via `actions/create-github-app-token` in the caller
@@ -27,10 +29,13 @@ Inside the Dagger container the module runs
 credentials as env vars **for the single terragrunt invocation only**. The
 session creds never leave the Dagger exec, and the OIDC token is mounted on
 a tmpfs (`/run/secrets/oidc-token`) so it is never logged, never persisted
-in the Dagger cache, and never exposed as a container env var. If provided,
-the git token is mounted on a separate tmpfs (`/run/secrets/gh-token`) and
-consumed by an in-memory `git config url.insteadOf` rule so terragrunt's
-module downloads authenticate as the `flo-ci` GitHub App installation.
+in the Dagger cache, and never exposed as a container env var. When both
+OIDC request inputs are supplied, the module atomically refreshes that file
+every five minutes. This supports Terraform provider aliases that lazily use
+`assume_role_with_web_identity` after the original JWT's ~10-minute lifetime.
+If provided, the git token is mounted as a separate secret and consumed by
+an in-memory `git config url.insteadOf` rule so terragrunt's module downloads
+authenticate as the `flo-ci` GitHub App installation.
 
 No path accepts `--aws-access-key-id` / `--aws-secret-access-key`. That
 would make it syntactically possible to pass a long-lived IAM user key, and
@@ -72,6 +77,10 @@ Optional:
 
 - `--git-token` — GitHub App installation token for private module cloning
   (see [Private module access](#private-module-access) below).
+- `--oidc-request-token` + `--oidc-request-url` — optional pair for long
+  plans/applies whose aliased providers read `/run/secrets/oidc-token` after
+  the initial JWT expires. Pass the request bearer as a Dagger secret; the
+  URL is non-secret. Supplying only one input is rejected.
 - `--region` (default `us-east-2`)
 - `--session-name` (default `dagger-terragrunt`; set to something
   CI-specific like `gha-${{ github.run_id }}` for traceability in CloudTrail)
