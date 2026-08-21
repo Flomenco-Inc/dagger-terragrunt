@@ -106,9 +106,13 @@ extract_handwritten() {
     skip { next }
     # drop lone @AGENTS.md import lines (re-emitted)
     /^@AGENTS\.md[[:space:]]*$/ { next }
-    # drop the stock Claude Code heading/blurb we re-emit
+    # drop Visibility: lines copied from AGENTS.md (re-emitted)
+    /^Visibility:[[:space:]]/ { next }
+    # drop the stock Claude Code heading/blurbs we re-emit
     /^## Claude Code[[:space:]]*$/ { next }
     /^- No glob auto-attach here:/ { next }
+    /^- Shared guidance lives in `AGENTS\.md`/ { next }
+    /^- Cursor rules \(if any\) live under ancestor/ { next }
     { print }
   ' "$file" | awk '
     # trim leading/trailing blank lines
@@ -121,6 +125,13 @@ extract_handwritten() {
       for (i=start; i<=end; i++) print lines[i]
     }
   '
+}
+
+# First Visibility: line from AGENTS.md (flo-context corpus metadata), if any.
+agents_visibility_line() {
+  local agents="$1"
+  [[ -f "$agents" ]] || return 0
+  awk '/^Visibility:[[:space:]]/ { print; exit }' "$agents"
 }
 
 build_claude_for_dir() {
@@ -166,9 +177,18 @@ build_claude_for_dir() {
   local handwritten
   handwritten="$(extract_handwritten "$claude")"
 
+  local visibility=""
+  if $has_agents; then
+    visibility="$(agents_visibility_line "$agents")"
+  fi
+
   local out=""
   if $has_agents; then
-    out+="@AGENTS.md"$'\n\n'
+    out+="@AGENTS.md"$'\n'
+    if [[ -n "$visibility" ]]; then
+      out+="${visibility}"$'\n'
+    fi
+    out+=$'\n'
   fi
 
   if $has_rules; then
@@ -207,9 +227,9 @@ build_claude_for_dir() {
   fi
 
   if [[ -f "$claude" ]]; then
-    local existing
-    existing="$(cat "$claude")"
-    if [[ "$existing" == "$out" ]]; then
+    # Do not use $(cat) — command substitution strips trailing newlines and
+    # makes the equality check flap, rewriting every run.
+    if printf '%s' "$out" | cmp -s - "$claude"; then
       echo "  = $claude (unchanged)"
       return 0
     fi
