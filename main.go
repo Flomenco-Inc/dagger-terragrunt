@@ -106,10 +106,13 @@ const (
 	// this server-side.
 	defaultDurationSeconds = 900
 
-	// Where the OIDC JWT is mounted inside the container. Dagger secret
-	// mounts live on a tmpfs that is only readable for the duration of the
-	// exec — the right place for short-lived credential material.
-	oidcTokenPath = "/run/secrets/oidc-token"
+	// The mutable provider token lives on a separate temp mount so it never
+	// enters the container snapshot. The stable path expected by Terraform
+	// is a symlink to that file. Caller inputs remain Dagger Secret mounts.
+	oidcTokenPath        = "/run/secrets/oidc-token"
+	oidcMutableTokenPath = "/run/oidc/token"
+	oidcInitialTokenPath = "/run/secrets/oidc-token-initial"
+	oidcRequestTokenPath = "/run/secrets/oidc-request-token"
 
 	// Where the optional GitHub App installation token is mounted. Used
 	// by the insteadOf git-config rule so terragrunt's module downloads
@@ -178,6 +181,15 @@ func (m *DaggerTerragrunt) Plan(
 	// `sts.amazonaws.com` audience. Passed as a Secret so Dagger mounts it
 	// on a tmpfs inside the container and never logs it.
 	oidcToken *dagger.Secret,
+	// Optional GitHub Actions OIDC request bearer token. When paired with
+	// oidcRequestURL, refreshes the mounted provider JWT every five minutes
+	// so lazy cross-account provider initialization can outlive one JWT.
+	// +optional
+	oidcRequestToken *dagger.Secret,
+	// Optional GitHub Actions OIDC request URL. Must be paired with
+	// oidcRequestToken.
+	// +optional
+	oidcRequestURL string,
 	// Optional short-lived GitHub App installation token used to clone
 	// private Terraform modules referenced from terragrunt. Mint via
 	// `actions/create-github-app-token` in the caller workflow. When
@@ -256,7 +268,7 @@ func (m *DaggerTerragrunt) Plan(
 	summarize bool,
 ) (string, error) {
 	return m.runTerragrunt(
-		ctx, src, env, roleArn, oidcToken, gitToken,
+		ctx, src, env, roleArn, oidcToken, oidcRequestToken, oidcRequestURL, gitToken,
 		region, sessionName, durationSeconds, tgVersion, tfVersion,
 		extraEnv, leaf,
 		"run --all plan",
@@ -276,6 +288,12 @@ func (m *DaggerTerragrunt) Apply(
 	env string,
 	roleArn string,
 	oidcToken *dagger.Secret,
+	// Optional GitHub Actions OIDC refresh credentials. Both values must be
+	// provided together. See Plan() for details.
+	// +optional
+	oidcRequestToken *dagger.Secret,
+	// +optional
+	oidcRequestURL string,
 	// Optional short-lived GitHub App installation token used to clone
 	// private Terraform modules. See Plan() for details.
 	// +optional
@@ -311,7 +329,7 @@ func (m *DaggerTerragrunt) Apply(
 	leaf string,
 ) (string, error) {
 	return m.runTerragrunt(
-		ctx, src, env, roleArn, oidcToken, gitToken,
+		ctx, src, env, roleArn, oidcToken, oidcRequestToken, oidcRequestURL, gitToken,
 		region, sessionName, durationSeconds, tgVersion, tfVersion,
 		extraEnv, leaf,
 		// --auto-approve is a Terraform flag, not a Terragrunt flag;
@@ -338,7 +356,8 @@ func (m *DaggerTerragrunt) Apply(
 // runTerragrunt is the shared implementation behind Plan and Apply. It:
 //
 //  1. Normalises defaults.
-//  2. Mounts the OIDC token as a read-only secret file at /run/secrets/oidc-token.
+//  2. Copies the initial OIDC token into a mutable tmpfs file and optionally
+//     refreshes it from GitHub Actions every five minutes.
 //  3. Runs a single shell invocation that exchanges the OIDC token for
 //     temporary session credentials via `aws sts assume-role-with-web-identity`,
 //     exports them as env vars in that shell, and then runs terragrunt.
@@ -352,6 +371,8 @@ func (m *DaggerTerragrunt) runTerragrunt(
 	env string,
 	roleArn string,
 	oidcToken *dagger.Secret,
+	oidcRequestToken *dagger.Secret,
+	oidcRequestURL string,
 	gitToken *dagger.Secret,
 	region string,
 	sessionName string,
@@ -388,6 +409,9 @@ func (m *DaggerTerragrunt) runTerragrunt(
 	}
 	if oidcToken == nil {
 		return "", fmt.Errorf("oidc-token is required")
+	}
+	if (oidcRequestToken == nil) != (oidcRequestURL == "") {
+		return "", fmt.Errorf("oidc-request-token and oidc-request-url must be provided together")
 	}
 	if env == "" {
 		return "", fmt.Errorf("env is required")
@@ -495,7 +519,7 @@ unset gh_token
 		// file and looping with `< "$plans_list"`.
 		tgCmdBlock = fmt.Sprintf(`plan_log=$(mktemp)
 plans_list=$(mktemp)
-trap 'rm -f "$plan_log" "$plans_list"' EXIT
+trap 'rm -f "$plan_log" "$plans_list"; cleanup_oidc_refresh' EXIT
 if ! terragrunt --non-interactive %s > "$plan_log" 2>&1; then
   echo "::error::terragrunt plan failed; full log follows" >&2
   cat "$plan_log"
@@ -557,7 +581,33 @@ done < "$plans_list" | jq -s -r '
 `, terragruntCmdEffective)
 	}
 
+	oidcRefreshBlock := ""
+	if oidcRequestToken != nil {
+		oidcRefreshBlock = fmt.Sprintf(`refresh_oidc_token() {
+  while sleep 300; do
+    request_token=$(cat %q)
+    token_tmp=$(mktemp /run/oidc/token.XXXXXX)
+    if curl -sS --fail --max-time 30 \
+      -H "Authorization: Bearer ${request_token}" \
+      "${OIDC_REQUEST_URL}&audience=sts.amazonaws.com" \
+      | jq -er '.value // empty' > "${token_tmp}"; then
+      chmod 600 "${token_tmp}"
+      mv "${token_tmp}" %q
+    else
+      rm -f "${token_tmp}"
+      echo "warning: GitHub OIDC refresh failed; retrying in five minutes" >&2
+    fi
+    unset request_token
+  done
+}
+refresh_oidc_token &
+oidc_refresh_pid=$!
+`, oidcRequestTokenPath, oidcMutableTokenPath)
+	}
+
 	script := fmt.Sprintf(`set -eu
+install -m 600 %q %q
+ln -s %q %q
 oidc_jwt=$(cat %q)
 creds=$(aws sts assume-role-with-web-identity \
   --role-arn %q \
@@ -575,11 +625,24 @@ EOF
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 unset creds
 
+oidc_refresh_pid=""
+cleanup_oidc_refresh() {
+  if [ -n "${oidc_refresh_pid}" ]; then
+    kill "${oidc_refresh_pid}" 2>/dev/null || true
+    wait "${oidc_refresh_pid}" 2>/dev/null || true
+  fi
+}
+%s
+trap 'cleanup_oidc_refresh' EXIT
+
 %s
 cd %q
 %s`,
+		oidcInitialTokenPath, oidcMutableTokenPath,
+		oidcMutableTokenPath, oidcTokenPath,
 		oidcTokenPath,
 		roleArn, sessionName, durationSeconds,
+		oidcRefreshBlock,
 		gitAuthBlock,
 		cdPath, tgCmdBlock,
 	)
@@ -609,9 +672,17 @@ cd %q
 			"unzip -q /tmp/awscli.zip -d /tmp && " +
 			"/tmp/aws/install -i /usr/local/aws -b /usr/local/bin && " +
 			"rm -rf /tmp/awscli.zip /tmp/aws && aws --version"}).
-		// Mount OIDC JWT as a tmpfs file. Dagger guarantees the file is
-		// only readable for the lifetime of the exec and is never cached.
-		WithMountedSecret(oidcTokenPath, oidcToken)
+		// Keep the mutable provider JWT on a temp mount so refreshed
+		// credential material is never cached. Secret inputs remain
+		// independent mounts under /run/secrets.
+		WithMountedTemp("/run/oidc").
+		WithMountedSecret(oidcInitialTokenPath, oidcToken)
+
+	if oidcRequestToken != nil {
+		c = c.
+			WithMountedSecret(oidcRequestTokenPath, oidcRequestToken).
+			WithEnvVariable("OIDC_REQUEST_URL", oidcRequestURL)
+	}
 
 	if gitToken != nil {
 		c = c.WithMountedSecret(gitTokenPath, gitToken).
