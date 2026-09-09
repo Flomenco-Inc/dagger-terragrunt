@@ -92,6 +92,15 @@ collect_bridge_dirs() {
   done < <(find "$ROOT" \( -path '*/.git/*' -o -path '*/node_modules/*' -o -path '*/.venv/*' \) -prune -o -type d -path '*/.cursor/rules' -print0 2>/dev/null)
 }
 
+is_nested_checkout() {
+  local dir="$1"
+  while [[ "$dir" != "$ROOT" && "$dir" != "/" ]]; do
+    [[ -e "$dir/.git" ]] && return 0
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
 # Strip generated blocks and a leading @AGENTS.md import from existing content.
 # Remaining text is preserved as hand-written Claude-only notes.
 extract_handwritten() {
@@ -256,6 +265,7 @@ fi
 BRIDGE_DIRS=()
 while IFS= read -r d; do
   [[ -z "$d" ]] && continue
+  is_nested_checkout "$d" && continue
   BRIDGE_DIRS+=("$d")
 done < <(collect_bridge_dirs | sort -u)
 
