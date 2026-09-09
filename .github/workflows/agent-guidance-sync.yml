@@ -13,4 +13,4 @@ permissions:
 jobs:
   agent-guidance:
     name: check / agent-guidance
-    uses: Flomenco-Inc/flo-docs/.github/workflows/agent-guidance-sync.yml@main
+    uses: Flomenco-Inc/flo-docs/.github/workflows/agent-guidance-sync.yml@bde19b837699de8d6a11e791d5a5d197fd2c1910 # v1
