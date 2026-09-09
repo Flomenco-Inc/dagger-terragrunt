@@ -4,7 +4,7 @@
 set -euo pipefail
 
 # shellcheck disable=SC2034 # Read by the organization coverage audit.
-AGENT_GUIDANCE_TOOLING_VERSION=1
+AGENT_GUIDANCE_TOOLING_VERSION=2
 DRY_RUN=false
 ROOT=""
 
@@ -169,6 +169,7 @@ sync_skill_root() {
       echo "  ~ ${target_file#"$ROOT"/} (would write)"
     else
       mkdir -p "$(dirname "$target_file")"
+      [[ ! -L "$target_file" ]] || rm -f "$target_file"
       cp "$source_file" "$target_file"
       echo "  + ${target_file#"$ROOT"/}"
     fi
