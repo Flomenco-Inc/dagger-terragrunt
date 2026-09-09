@@ -1,0 +1,16 @@
+name: agent guidance sync
+
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  agent-guidance:
+    name: check / agent-guidance
+    uses: Flomenco-Inc/flo-docs/.github/workflows/agent-guidance-sync.yml@main
