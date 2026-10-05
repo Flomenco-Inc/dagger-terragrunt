@@ -286,7 +286,7 @@ jobs:
 
       - uses: dagger/dagger-for-github@v8
         with:
-          version: v0.20.6
+          version: v0.21.10
           call: |
             call -m github.com/Flomenco-Inc/dagger-terragrunt@v0.2.0 \
               plan --src=. --env=${{ matrix.env }} \
@@ -339,7 +339,7 @@ jobs:
 
       - uses: dagger/dagger-for-github@v8
         with:
-          version: v0.20.6
+          version: v0.21.10
           call: |
             call -m github.com/Flomenco-Inc/dagger-terragrunt@v0.2.0 \
               apply --src=. --env=${{ matrix.env }} \
