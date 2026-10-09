@@ -24,8 +24,9 @@ jobs:
       - name: Install Dagger CLI
         run: |
           set -eux
+          DAGGER_VERSION=$(jq -r '.engineVersion' dagger.json | sed 's/^v//')
           curl -fsSL https://dl.dagger.io/dagger/install.sh \
-            | DAGGER_VERSION=0.20.6 BIN_DIR=/usr/local/bin sudo -E sh
+            | DAGGER_VERSION="$DAGGER_VERSION" BIN_DIR=/usr/local/bin sudo -E sh
           dagger version
 
       - name: dagger develop (regenerates SDK bindings)
