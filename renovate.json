@@ -34,6 +34,15 @@
       ],
       "datasourceTemplate": "github-releases",
       "depNameTemplate": "{{#if (equals depNameCamel 'Terragrunt')}}gruntwork-io/terragrunt{{else if (equals depNameCamel 'Terraform')}}hashicorp/terraform{{/if}}"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the digest-pinned ECR Public debian base image (never Docker Hub, flo#2544)",
+      "managerFilePatterns": ["internal/baseimage/baseimage.go"],
+      "matchStrings": [
+        "\"(?<depName>public\\.ecr\\.aws/docker/library/debian):(?<currentValue>[^@\"]+)@(?<currentDigest>sha256:[0-9a-f]{64})\""
+      ],
+      "datasourceTemplate": "docker"
     }
   ],
   "vulnerabilityAlerts": {

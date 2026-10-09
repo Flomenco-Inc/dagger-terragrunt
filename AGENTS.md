@@ -106,6 +106,12 @@ credentials exist only for the duration of one `WithExec` call.
   match the `env` param.
 - **Do not couple this module to flo-specific env names.** `env` is free-
   form; the module just cds into `./<env>/`.
+- **Do not pull base images from Docker Hub.** An unqualified ref like
+  `debian:stable-slim` resolves to `docker.io`, and GitHub-hosted runners
+  pull it anonymously; Docker Hub's rate limit failed every apply on
+  2026-10-09 (flo#2544). Use the ECR Public mirror of Docker Official Images
+  (`public.ecr.aws/docker/library/<image>:<tag>@sha256:…`), pinned in
+  `internal/baseimage` and tracked by Renovate.
 - **Do not commit `internal/dagger/` or `dagger.gen.go`.**
 - **Do not print `$creds` or any intermediate shell variable** inside the
   runTerragrunt script. The script deliberately uses `set -eu` (not `-x`)
