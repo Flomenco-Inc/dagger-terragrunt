@@ -82,6 +82,7 @@ import (
 	"fmt"
 	"strings"
 
+	"dagger/dagger-terragrunt/internal/baseimage"
 	"dagger/dagger-terragrunt/internal/dagger"
 	"dagger/dagger-terragrunt/internal/extraenv"
 )
@@ -711,7 +712,9 @@ cd %q
 // because validate doesn't need it and we want validate to stay fast and
 // host-arch-agnostic.
 //
-// Base: debian:stable-slim. HashiCorp + Gruntwork binaries are glibc-linked.
+// Base: Docker's official debian:stable-slim from the ECR Public mirror,
+// digest-pinned in internal/baseimage (never Docker Hub — see flo#2544).
+// HashiCorp + Gruntwork binaries are glibc-linked.
 // Tool downloads use architecture-detected URLs so the container runs
 // natively on both amd64 (CI) and arm64 (Apple Silicon dev laptops).
 func (m *DaggerTerragrunt) baseContainer(
@@ -724,7 +727,7 @@ func (m *DaggerTerragrunt) baseContainer(
 	archNormalise := `arch=$(uname -m); case "$arch" in x86_64) tfarch=amd64 ;; aarch64) tfarch=arm64 ;; *) echo "unsupported arch: $arch" >&2; exit 1 ;; esac`
 
 	return dag.Container().
-		From("debian:stable-slim").
+		From(baseimage.Debian).
 		// bash is explicitly installed alongside the usual tooling. The
 		// terragrunt bootstrap script relies on bash-only features
 		// (`$'\t'` ANSI-C quoting for IFS, `${VAR:0:N}` substring
@@ -736,7 +739,7 @@ func (m *DaggerTerragrunt) baseContainer(
 			// jq is used by the plan summarize path in runTerragrunt to
 			// turn `terraform show -json tfplan.bin` into a compact
 			// per-leaf changeset list. Cheap (~600 KB), pinned via
-			// debian:stable-slim's package set.
+			// the debian stable-slim base's package set.
 			"ca-certificates curl unzip git bash jq && rm -rf /var/lib/apt/lists/*"}).
 		WithExec([]string{"sh", "-c", fmt.Sprintf(
 			"set -eux; %s; "+
